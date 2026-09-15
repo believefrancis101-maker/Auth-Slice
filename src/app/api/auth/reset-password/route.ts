@@ -40,10 +40,9 @@ export async function POST(request: NextRequest) {
     }
 
     // ── SERVER-SIDE REJECTION #2: Token already used ─────────────────────────
-    // usedAt is set atomically when the token is consumed. Any subsequent
-    // request — from the same user clicking "back", a browser extension, or an
-    // attacker who intercepted the link — hits this check and is rejected.
-    // The token is NOT deleted after use so this audit record persists.
+    // Fast-fail check for non-concurrent requests. Note: this check alone does
+    // not protect against concurrent replay; atomic token claiming is enforced
+    // in the conditional database update inside the transaction below.
     if (resetRecord.usedAt !== null) {
       return NextResponse.json(
         {
@@ -58,9 +57,8 @@ export async function POST(request: NextRequest) {
 
     // ── SERVER-SIDE REJECTION #3: Token expired ───────────────────────────────
     // expiresAt is stored in the database and compared against the server clock.
-    // A client manipulating browser timers, JS execution context, or their system
-    // clock cannot bypass this — it is a pure server-side database comparison.
-    if (resetRecord.expiresAt < new Date()) {
+    const now = new Date();
+    if (resetRecord.expiresAt < now) {
       return NextResponse.json(
         {
           error:
@@ -72,27 +70,82 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Token is valid: hash the new password and mark the token as used atomically
+    // Token is preliminarily valid: hash the new password
     const newPasswordHash = await hash(password);
 
-    await prisma.$transaction([
-      // Update the user's password
-      prisma.user.update({
-        where: { id: resetRecord.userId },
-        data: { passwordHash: newPasswordHash },
-      }),
-      // Mark the token consumed — this is what prevents replay
-      prisma.passwordResetToken.update({
+    // ── ATOMIC TOKEN CONSUMPTION & STATE TRANSITION ──────────────────────────
+    // To prevent race conditions from concurrent requests with the same token:
+    // 1. Atomically claim the token using a conditional update requiring usedAt to
+    //    still be null and expiresAt to still be in the future.
+    // 2. Only exactly ONE concurrent request will have count === 1.
+    // 3. Any concurrent request that loses the race gets count === 0 and is rejected.
+    // 4. After successfully claiming the token, update the password and invalidate
+    //    all existing sessions in a transaction. If this step fails, roll back the
+    //    token claim so token consumption and password change remain atomic.
+    const claimTimestamp = new Date();
+
+    const claim = await prisma.passwordResetToken.updateMany({
+      where: {
+        id: resetRecord.id,
+        usedAt: null,
+        expiresAt: { gt: claimTimestamp },
+      },
+      data: {
+        usedAt: claimTimestamp,
+      },
+    });
+
+    if (claim.count === 0) {
+      // Re-read token to return specific error for the loser of the race condition
+      const freshRecord = await prisma.passwordResetToken.findUnique({
         where: { id: resetRecord.id },
-        data: { usedAt: new Date() },
-      }),
-      // Invalidate all active sessions so existing logins are kicked out.
-      // Without this, an attacker who compromised the account can stay logged
-      // in even after the legitimate owner resets their password.
-      prisma.session.deleteMany({
-        where: { userId: resetRecord.userId },
-      }),
-    ]);
+      });
+
+      if (freshRecord?.usedAt) {
+        return NextResponse.json(
+          {
+            error:
+              "This reset link has already been used. If you still need to reset your password, please request a new link.",
+            code: "TOKEN_ALREADY_USED",
+            usedAt: freshRecord.usedAt.toISOString(),
+          },
+          { status: 400 }
+        );
+      }
+
+      return NextResponse.json(
+        {
+          error:
+            "This reset link has expired. Password reset links are only valid for 15 minutes. Please request a new one.",
+          code: "TOKEN_EXPIRED",
+          expiredAt: freshRecord?.expiresAt.toISOString() ?? resetRecord.expiresAt.toISOString(),
+        },
+        { status: 400 }
+      );
+    }
+
+    // Successfully claimed the token: now update password and invalidate sessions
+    try {
+      await prisma.$transaction([
+        // Update the user's password
+        prisma.user.update({
+          where: { id: resetRecord.userId },
+          data: { passwordHash: newPasswordHash },
+        }),
+        // Invalidate all active sessions so existing logins are kicked out.
+        prisma.session.deleteMany({
+          where: { userId: resetRecord.userId },
+        }),
+      ]);
+    } catch (txError) {
+      // In the rare event the password update or session deletion fails,
+      // revert the token claim so token consumption and password change remain atomic.
+      await prisma.passwordResetToken.updateMany({
+        where: { id: resetRecord.id, usedAt: claimTimestamp },
+        data: { usedAt: null },
+      });
+      throw txError;
+    }
 
     return NextResponse.json(
       {

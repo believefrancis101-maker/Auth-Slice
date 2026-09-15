@@ -121,7 +121,7 @@ Regardless of whether the account exists, the server returns an identical `200` 
 
 The user clicks the link, landing at `/reset-password?token=<rawToken>` (`src/app/reset-password/page.tsx`). The form posts `{ token, password, confirmPassword }` to `POST /api/auth/reset-password` (`src/app/api/auth/reset-password/route.ts`).
 
-The server re-derives the SHA-256 hash from the submitted token and looks it up. Three checks run in sequence: token not found (`TOKEN_INVALID`), token already used — `usedAt IS NOT NULL` (`TOKEN_ALREADY_USED`), and token expired (`TOKEN_EXPIRED`). Each returns a distinct error code the frontend maps to a specific screen with a call-to-action. If all checks pass, a Prisma transaction atomically updates `passwordHash`, stamps `usedAt` on the token (preserving the audit record without deleting the row), and deletes all active sessions for that user — so an attacker who used the link is immediately kicked out when the legitimate owner resets their password.
+The server re-derives the SHA-256 hash from the submitted token and looks it up. Fast-fail checks run in sequence: token not found (`TOKEN_INVALID`), token already used — `usedAt IS NOT NULL` (`TOKEN_ALREADY_USED`), and token expired (`TOKEN_EXPIRED`). Each returns a distinct error code the frontend maps to a specific screen with a call-to-action. To protect against concurrent race conditions, token consumption is made atomic at the database level via a conditional update (`usedAt = now WHERE id = ? AND usedAt IS NULL AND expiresAt > now`). Exactly one concurrent request can successfully claim the token (affecting 1 row); any concurrent replay affects 0 rows and is rejected as `TOKEN_ALREADY_USED`. The winning request then updates `passwordHash` and deletes all active sessions in an atomic transaction, invalidating existing sessions immediately.
 
 ---
 
@@ -205,7 +205,7 @@ One row per reset request. Rows are never deleted on use — `usedAt` is set ins
 | `usedAt` | DateTime | **Yes** | Null until consumed. Non-null blocks replay. |
 | `createdAt` | DateTime | No | Audit timestamp. |
 
-**Which constraints make invalid state impossible?** `@unique` on `tokenHash` means two concurrent requests with the same raw token cannot both land. `usedAt IS NOT NULL` is checked by the server before the password update — it is a database column, not a client-side flag. A single Prisma transaction sets `usedAt` and updates the password atomically, so the token cannot be in a state where it is "used" but the password remains unchanged, or vice versa.
+**Which constraints make invalid state impossible?** `@unique` on `tokenHash` prevents duplicate token records. Single-use under concurrent requests is enforced via an atomic conditional database update (`WHERE id = ? AND usedAt IS NULL AND expiresAt > now`) where only the first request modifies a row. The password update and session revocation follow in a transaction that reverts the claim if interrupted, preventing partial state where a token is consumed without the password changing or vice-versa.
 
 ---
 
@@ -373,7 +373,7 @@ await prisma.$transaction([
 ]);
 ```
 
-The reset-password route wraps the password update, `usedAt` stamp, and session deletion in one transaction for the same reason.
+The reset-password route similarly guarantees atomicity: it claims the token via an atomic conditional database update (`usedAt IS NULL AND expiresAt > now`) to eliminate concurrent replay races, followed by a transaction updating `passwordHash` and deleting active sessions, reverting the claim if the transaction fails.
 
 **What was chosen against.** Sequential independent writes were explicitly rejected. Process crashes, OOM kills, and database network interruptions happen in production and would leave the application in states very difficult to recover from automatically.
 
