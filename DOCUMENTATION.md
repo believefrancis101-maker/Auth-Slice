@@ -410,6 +410,19 @@ The concurrent race condition (two identical requests both passing the existence
 
 ---
 
+### Evidence
+
+The following assessment evidence screenshots demonstrate the implementation and runtime verification of the authentication workflow controls:
+
+* `Evidence/01-password-hashing.png` — Password hashing evidence showing that the stored password is an adaptive bcrypt hash rather than plaintext.
+* `Evidence/02-signup-curl.png` — Exact curl signup request and successful server response.
+* `Evidence/03-server-validation.png` — Server-side validation rejecting invalid password input with HTTP 400.
+* `Evidence/04-rate-limit.png` — Sign-in rate-limit evidence showing the HTTP 429 response and Retry-After information.
+* `Evidence/05-verification-code-active.png` — Verification code database record showing the code and its expiration timestamp.
+* `Evidence/06-verification-code-expired.png` — Evidence after expiration showing that the expired verification code is rejected.
+
+---
+
 ## 6. What Went Wrong
 
 ### Problem 1 — Rate-limit store lost on every hot-reload
